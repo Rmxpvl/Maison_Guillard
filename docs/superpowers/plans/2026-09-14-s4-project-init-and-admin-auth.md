@@ -1,846 +1,794 @@
-# S4 — Project Init & Admin Auth Implementation Plan
+# S4 — Project Init & Admin Auth Implementation Plan (Python/FastAPI)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Revision note (2026-09-14):** this plan originally targeted Node.js/Express/Prisma. The stack
+> was changed to Python/FastAPI/SQLAlchemy/Alembic after Task 1-2 were already implemented and
+> reviewed under the old stack — those tasks were reverted (see spec's "Stack amendment" note) and
+> redone here. Task numbering restarts clean for the new stack; nothing from the Node
+> implementation carries forward.
 
 **Goal:** Stand up the Maison Guillard monorepo (backend + frontend + local Postgres) and ship a
 working admin authentication flow (`POST /api/auth/login` + a login page), matching the plan de
 route's Semaine 4 objective: "Initialiser le projet (backend, base de données, squelette
 frontend) ; authentification et autorisation administrateur."
 
-**Architecture:** Two independent Node apps in one repo (`backend/`, `frontend/`), no shared
-workspace tooling. Backend is Express + Prisma/PostgreSQL exposing a REST API under `/api`;
-frontend is a Vite + React SPA that calls it over `fetch`. Postgres runs locally via
-docker-compose. Auth is stateless JWT + bcrypt, single admin account, no roles beyond "is admin."
+**Architecture:** Two independent apps in one repo (`backend/`, `frontend/`), no shared tooling.
+Backend is FastAPI + SQLAlchemy/PostgreSQL exposing a REST API under `/api`; frontend is a Vite +
+React SPA that calls it over `fetch`. Postgres runs locally via docker-compose. Auth is stateless
+JWT + bcrypt, single admin account, no roles beyond "is admin."
 
-**Tech Stack:** Node.js (LTS, v25.8.1 confirmed locally), Express, Prisma, PostgreSQL 16
-(docker-compose), Vitest + Supertest, React 18 + Vite, jsonwebtoken, bcrypt.
+**Tech Stack:** Python 3.14.4, FastAPI, Uvicorn, SQLAlchemy 2.x, Alembic, Pydantic, PyJWT,
+passlib[bcrypt], pytest + httpx (via FastAPI `TestClient`), PostgreSQL 16 (docker-compose),
+Node.js v25.8.1 + React 18 + Vite (frontend only).
 
 **Spec:** `docs/superpowers/specs/2026-09-14-maison-guillard-mvp-design.md`
 
 ## Global Constraints
 
-- Node.js LTS as the floor (v25.8.1 confirmed on this machine — do not require a newer minimum).
+- Python 3.14.4 as the floor (confirmed locally).
 - Conventional Commits format for every commit (`feat:`, `fix:`, `docs:`, `chore:`, `test:`,
   `refactor:`).
-- Work happens on branch `feature/s4-init` (create from `main`); do not commit directly to `main`
-  beyond what's already there.
-- No secrets committed: `.env` files are gitignored; `.env.example` documents required vars with
-  placeholder values only.
-- Backend `app.js` must export the Express app WITHOUT calling `.listen()` — `server.js` is the
-  only place that listens, so tests can import `app.js` and use Supertest without binding a port.
+- Work happens on branch `feature/s4-init` (already checked out — do not create it again).
+- No secrets committed: `.env` files gitignored; `.env.example` documents required vars with
+  placeholder values only. `backend/.venv/` is also gitignored — never commit a virtualenv.
+- `backend/app/main.py` must build and export the FastAPI `app` instance WITHOUT calling
+  `uvicorn.run()` — that call lives only in a separate `backend/run.py` (or is invoked via the
+  `uvicorn` CLI directly), so tests can import `app` and use `TestClient` without binding a port.
+- Docker-compose Postgres (from the earlier Node-stack work, still valid/unaffected by the pivot):
+  user `maison`, password `maison_dev_password`, db `maison_guillard`, port 5432. Do not recreate
+  `docker-compose.yml` — it already exists at the repo root with these values.
 
 ---
 
-### Task 1: Repo skeleton, docker-compose Postgres, gitignore
+### Task 1: Backend Python project skeleton, venv, FastAPI health check
 
 **Files:**
-- Create: `backend/` (empty dir, populated in Task 2)
-- Create: `frontend/` (empty dir, populated in Task 7)
-- Create: `docker-compose.yml`
-- Create: `.gitignore`
-- Create: `README.md`
-
-**Interfaces:**
-- Produces: a running Postgres instance reachable at `localhost:5432`, database `maison_guillard`,
-  user/password `maison`/`maison_dev_password` — later tasks' `DATABASE_URL` values depend on
-  these exact values.
-
-- [ ] **Step 1: Create `.gitignore`**
-
-```gitignore
-node_modules/
-.env
-.env.*
-!.env.example
-dist/
-build/
-*.log
-.DS_Store
-```
-
-- [ ] **Step 2: Create `docker-compose.yml`**
-
-```yaml
-services:
-  postgres:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: maison
-      POSTGRES_PASSWORD: maison_dev_password
-      POSTGRES_DB: maison_guillard
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U maison -d maison_guillard"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-volumes:
-  postgres_data:
-```
-
-- [ ] **Step 3: Create root `README.md`**
-
-```markdown
-# Maison Guillard
-
-Web app for presenting and selling handmade furniture. See
-`docs/superpowers/specs/2026-09-14-maison-guillard-mvp-design.md` for the design and
-`docs/superpowers/plans/` for implementation plans.
-
-## Local dev setup
-
-1. `docker compose up -d` — starts Postgres on `localhost:5432`.
-2. `cd backend && cp .env.example .env && npm install && npx prisma migrate dev && npm run seed && npm run dev`
-3. `cd frontend && npm install && npm run dev`
-```
-
-- [ ] **Step 4: Start Postgres and verify it's healthy**
-
-Run: `docker compose up -d && docker compose ps`
-Expected: `postgres` service listed with `STATUS` containing `healthy` (wait a few seconds and
-re-run `docker compose ps` if it still says `starting`).
-
-- [ ] **Step 5: Create branch and commit**
-
-```bash
-git checkout -b feature/s4-init
-mkdir -p backend frontend
-git add .gitignore docker-compose.yml README.md
-git commit -m "chore: scaffold repo skeleton with docker-compose postgres"
-```
-
----
-
-### Task 2: Backend Express skeleton with health check
-
-**Files:**
-- Create: `backend/package.json`
-- Create: `backend/src/app.js`
-- Create: `backend/src/server.js`
-- Create: `backend/vitest.config.js`
-- Test: `backend/tests/integration/health.test.js`
+- Create: `backend/requirements.txt`
+- Create: `backend/app/__init__.py`
+- Create: `backend/app/main.py`
+- Create: `backend/pytest.ini`
+- Create: `backend/.gitignore` (venv-specific; root `.gitignore` already covers `.env`)
+- Test: `backend/tests/__init__.py`, `backend/tests/integration/__init__.py`,
+  `backend/tests/integration/test_health.py`
 
 **Interfaces:**
 - Consumes: nothing (first backend code).
-- Produces: `app.js` exports `module.exports = app` (an Express instance, no `.listen()` call) —
-  every later backend test imports this. `server.js` is the process entrypoint (`node
-  src/server.js`), reading `PORT` from env (default `3000`).
+- Produces: `app/main.py` exposes `app` (a `FastAPI()` instance, no server-start call) — every
+  later backend test and the eventual `uvicorn app.main:app` invocation import this exact name.
 
-- [ ] **Step 1: Init backend package and install dependencies**
+- [ ] **Step 1: Create and activate a virtualenv, from `backend/`**
 
 ```bash
 cd backend
-npm init -y
-npm install express dotenv cors
-npm install --save-dev vitest supertest
+python -m venv .venv
 ```
 
-- [ ] **Step 2: Set `backend/package.json` scripts and type**
+Activate it (Windows Git Bash): `source .venv/Scripts/activate` — your prompt should now show
+`(.venv)`. Run every following `pip`/`pytest`/`uvicorn` command from this activated shell.
 
-Edit `backend/package.json` — add/merge these fields:
+- [ ] **Step 2: Create `backend/requirements.txt`**
 
-```json
-{
-  "type": "commonjs",
-  "scripts": {
-    "dev": "node src/server.js",
-    "test": "vitest run",
-    "test:watch": "vitest"
-  }
-}
+```
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+alembic==1.14.0
+psycopg2-binary==2.9.10
+pydantic==2.10.4
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.1
+pytest==8.3.4
+httpx==0.28.1
 ```
 
-- [ ] **Step 3: Write the failing test**
+- [ ] **Step 3: Install dependencies**
 
-```javascript
-// backend/tests/integration/health.test.js
-const request = require('supertest');
-const { describe, it, expect } = require('vitest');
-const app = require('../../src/app');
+Run: `pip install -r requirements.txt`
+Expected: all packages install without error.
 
-describe('GET /api/health', () => {
-  it('returns 200 with status ok', async () => {
-    const res = await request(app).get('/api/health');
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ status: 'ok' });
-  });
-});
+- [ ] **Step 4: Create `backend/pytest.ini`**
+
+```ini
+[pytest]
+testpaths = tests
+pythonpath = .
 ```
 
-- [ ] **Step 4: Create `backend/vitest.config.js`**
-
-```javascript
-const { defineConfig } = require('vitest/config');
-
-module.exports = defineConfig({
-  test: {
-    globals: false,
-    environment: 'node',
-  },
-});
-```
-
-- [ ] **Step 5: Run test to verify it fails**
-
-Run (from `backend/`): `npm test`
-Expected: FAIL — `Cannot find module '../../src/app'`
-
-- [ ] **Step 6: Create `backend/src/app.js`**
-
-```javascript
-const express = require('express');
-const cors = require('cors');
-
-const app = express();
-
-app.use(cors());
-app.use(express.json());
-
-app.get('/api/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
-});
-
-module.exports = app;
-```
-
-- [ ] **Step 7: Create `backend/src/server.js`**
-
-```javascript
-require('dotenv').config();
-const app = require('./app');
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`Maison Guillard API listening on port ${PORT}`);
-});
-```
-
-- [ ] **Step 8: Run test to verify it passes**
-
-Run (from `backend/`): `npm test`
-Expected: PASS (1 test)
-
-- [ ] **Step 9: Commit**
+- [ ] **Step 5: Create empty `__init__.py` markers**
 
 ```bash
-git add backend/package.json backend/package-lock.json backend/src backend/tests backend/vitest.config.js
-git commit -m "feat: add express app skeleton with health check endpoint"
+mkdir -p app tests/unit tests/integration
+touch app/__init__.py tests/__init__.py tests/unit/__init__.py tests/integration/__init__.py
+```
+
+- [ ] **Step 6: Write the failing test**
+
+```python
+# backend/tests/integration/test_health.py
+from fastapi.testclient import TestClient
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_health_returns_ok():
+    response = client.get("/api/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+```
+
+- [ ] **Step 7: Run test to verify it fails**
+
+Run: `pytest tests/integration/test_health.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'app.main'`
+
+- [ ] **Step 8: Create `backend/app/main.py`**
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI(title="Maison Guillard API")
+
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok"}
+```
+
+- [ ] **Step 9: Run test to verify it passes**
+
+Run: `pytest tests/integration/test_health.py -v`
+Expected: PASS (1 test)
+
+- [ ] **Step 10: Create `backend/.gitignore`**
+
+```gitignore
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+```
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add backend/requirements.txt backend/app backend/tests backend/pytest.ini backend/.gitignore
+git commit -m "feat: add FastAPI app skeleton with health check endpoint"
 ```
 
 ---
 
-### Task 3: Prisma schema, migration, shared client
+### Task 2: SQLAlchemy engine/session, Admin model, Alembic migration
 
 **Files:**
-- Create: `backend/prisma/schema.prisma`
-- Create: `backend/src/lib/prisma.js`
+- Create: `backend/app/database.py`
+- Create: `backend/app/models/__init__.py`
+- Create: `backend/app/models/admin.py`
 - Create: `backend/.env.example`
-- Modify: `backend/package.json` (add `prisma` deps + `postinstall`/`migrate` scripts)
+- Create: `backend/alembic.ini`
+- Create: `backend/alembic/env.py`
+- Create: `backend/alembic/versions/` (populated by `alembic revision` in Step 6)
 
 **Interfaces:**
-- Consumes: `DATABASE_URL` env var (from `.env`, pointing at the docker-compose Postgres from
-  Task 1).
-- Produces: `backend/src/lib/prisma.js` exports a singleton `PrismaClient` instance
-  (`module.exports = prisma`) — every service in later tasks imports this instead of constructing
-  its own client. The `Admin` model (fields: `id`, `email`, `passwordHash`, `createdAt`) is now
-  queryable via `prisma.admin.*`.
+- Consumes: `DATABASE_URL` env var (from `.env`, pointing at the docker-compose Postgres).
+- Produces: `app/database.py` exports `engine`, `SessionLocal`, `Base`, and a `get_db()` generator
+  (FastAPI dependency, yields a `Session` and closes it after the request) — every later router and
+  service imports these exact names. `app/models/admin.py` exports the `Admin` ORM class
+  (`__tablename__ = "admin"`, columns `id`, `email`, `password_hash`, `created_at`) — queryable via
+  `db.query(Admin)` once a `Session` is obtained.
 
-- [ ] **Step 1: Install Prisma**
-
-```bash
-cd backend
-npm install @prisma/client
-npm install --save-dev prisma
-```
-
-- [ ] **Step 2: Create `backend/prisma/schema.prisma`**
-
-```prisma
-generator client {
-  provider = "prisma-client-js"
-}
-
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
-}
-
-model Admin {
-  id           Int      @id @default(autoincrement())
-  email        String   @unique
-  passwordHash String
-  createdAt    DateTime @default(now())
-}
-```
-
-- [ ] **Step 3: Create `backend/.env.example`**
+- [ ] **Step 1: Create `backend/.env.example`**
 
 ```
-DATABASE_URL="postgresql://maison:maison_dev_password@localhost:5432/maison_guillard?schema=public"
-JWT_SECRET="replace-with-a-long-random-string"
-SEED_ADMIN_EMAIL="admin@maisonguillard.fr"
-SEED_ADMIN_PASSWORD="replace-with-a-strong-password"
-PORT=3000
+DATABASE_URL=postgresql+psycopg2://maison:maison_dev_password@localhost:5432/maison_guillard
+JWT_SECRET=replace-with-a-long-random-string
+SEED_ADMIN_EMAIL=admin@maisonguillard.fr
+SEED_ADMIN_PASSWORD=replace-with-a-strong-password
 ```
 
-- [ ] **Step 4: Create local `.env` for development (not committed)**
+- [ ] **Step 2: Create local `.env` (not committed)**
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `backend/.env` and set `JWT_SECRET` to a real random value (e.g. run
-`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` and paste the output),
-and set `SEED_ADMIN_PASSWORD` to a real password you'll use to log in locally.
+Edit `backend/.env` and set `JWT_SECRET` to a real random value — run
+`python -c "import secrets; print(secrets.token_hex(32))"` and paste the output — and set
+`SEED_ADMIN_PASSWORD` to a real password you'll use to log in locally.
 
-- [ ] **Step 5: Create `backend/src/lib/prisma.js`**
+- [ ] **Step 3: Create `backend/app/database.py`**
 
-```javascript
-const { PrismaClient } = require('@prisma/client');
+```python
+import os
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-const prisma = new PrismaClient();
+load_dotenv()
 
-module.exports = prisma;
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 ```
 
-- [ ] **Step 6: Run the first migration**
+- [ ] **Step 4: Create `backend/app/models/__init__.py`**
 
-Run (from `backend/`): `npx prisma migrate dev --name init`
-Expected: prompts create `prisma/migrations/<timestamp>_init/migration.sql`, applies it to the
-`maison_guillard` database, and prints "Your database is now in sync with your schema."
+```python
+from app.models.admin import Admin
 
-- [ ] **Step 7: Verify the table exists**
+__all__ = ["Admin"]
+```
 
-Run: `npx prisma studio` (opens a browser UI) — or non-interactively:
-`docker compose exec postgres psql -U maison -d maison_guillard -c '\d "Admin"'`
-Expected: shows the `Admin` table with columns `id, email, passwordHash, createdAt`.
-Close/stop Prisma Studio (Ctrl+C) before continuing.
+- [ ] **Step 5: Create `backend/app/models/admin.py`**
 
-- [ ] **Step 8: Commit**
+```python
+from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy.sql import func
+from app.database import Base
+
+
+class Admin(Base):
+    __tablename__ = "admin"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+```
+
+- [ ] **Step 6: Initialize Alembic**
+
+Run: `alembic init alembic`
+Expected: creates `backend/alembic/` (with `env.py`, `script.py.mako`, `versions/`) and
+`backend/alembic.ini`.
+
+- [ ] **Step 7: Point Alembic at `DATABASE_URL` and the models' metadata**
+
+Edit `backend/alembic.ini` — find the line starting `sqlalchemy.url =` and delete/comment it out
+(we set the URL from the environment instead, in `env.py`, so the real password never sits in a
+committed ini file):
+
+```ini
+# sqlalchemy.url = driver://user:pass@localhost/dbname
+```
+
+Edit `backend/alembic/env.py` — near the top, after the existing imports, add:
+
+```python
+import os
+import sys
+sys.path.insert(0, os.getcwd())
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from app.database import Base
+from app.models import Admin  # noqa: F401 — import so Base.metadata sees the table
+
+config.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
+target_metadata = Base.metadata
+```
+
+(This replaces the template's `target_metadata = None` line — search for it and replace it with
+the block above, keeping the rest of the generated `env.py` as-is.)
+
+- [ ] **Step 8: Generate and apply the first migration**
+
+Run: `alembic revision --autogenerate -m "create admin table"`
+Expected: writes a new file under `backend/alembic/versions/` containing `op.create_table("admin",
+...)`.
+
+Run: `alembic upgrade head`
+Expected: "Running upgrade -> <revision>, create admin table" with no errors.
+
+- [ ] **Step 9: Verify the table exists**
+
+Run: `docker compose exec postgres psql -U maison -d maison_guillard -c '\d admin'`
+Expected: shows the `admin` table with columns `id, email, password_hash, created_at`.
+
+- [ ] **Step 10: Commit**
 
 ```bash
-git add backend/prisma backend/src/lib backend/.env.example backend/package.json backend/package-lock.json
-git commit -m "feat: add prisma schema with Admin model and initial migration"
+git add backend/app/database.py backend/app/models backend/.env.example backend/alembic.ini backend/alembic
+git commit -m "feat: add SQLAlchemy engine, Admin model, and initial Alembic migration"
 ```
 
 ---
 
-### Task 4: AuthService (unit tests, Prisma mocked)
+### Task 3: `auth_service` (unit tests, DB session faked)
 
 **Files:**
-- Create: `backend/src/services/auth.service.js`
-- Test: `backend/tests/unit/auth.service.test.js`
-- Modify: `backend/package.json` (add `bcrypt`, `jsonwebtoken`)
+- Create: `backend/app/services/__init__.py`
+- Create: `backend/app/services/auth_service.py`
+- Test: `backend/tests/unit/test_auth_service.py`
+- Modify: `backend/requirements.txt` (already has needed deps from Task 1 — no change expected,
+  listed here only in case a version conflict surfaces during install)
 
 **Interfaces:**
-- Consumes: `backend/src/lib/prisma.js` (mocked in this task's tests).
-- Produces: `AuthService.hashPassword(plain: string): Promise<string>`,
-  `AuthService.verifyPassword(plain: string, hash: string): Promise<boolean>`,
-  `AuthService.login(email: string, password: string): Promise<{ token: string }>` (throws
-  `InvalidCredentialsError` on bad email/password), `AuthService.verifyToken(token: string):
-  { sub: number, email: string }` (throws on invalid/expired token). Task 5's route and
-  middleware call these exact names.
+- Consumes: `Admin` model (Task 2).
+- Produces: `auth_service.hash_password(plain: str) -> str`,
+  `auth_service.verify_password(plain: str, hashed: str) -> bool`,
+  `auth_service.login(db: Session, email: str, password: str) -> str` (returns a JWT string, raises
+  `auth_service.InvalidCredentialsError` on bad email/password),
+  `auth_service.verify_token(token: str) -> dict` (raises `jwt.InvalidTokenError` — from
+  `jose.exceptions` — on invalid/expired token). Task 4's route and dependency call these exact
+  names.
 
-- [ ] **Step 1: Install auth dependencies**
-
-```bash
-cd backend
-npm install bcrypt jsonwebtoken
-```
+- [ ] **Step 1: Create `backend/app/services/__init__.py`** (empty file)
 
 - [ ] **Step 2: Write the failing tests**
 
-```javascript
-// backend/tests/unit/auth.service.test.js
-const { describe, it, expect, vi, beforeEach } = require('vitest');
+```python
+# backend/tests/unit/test_auth_service.py
+import os
+from unittest.mock import MagicMock
+import pytest
 
-vi.mock('../../src/lib/prisma', () => ({
-  __esModule: true,
-  default: undefined,
-  admin: {
-    findUnique: vi.fn(),
-  },
-}));
+os.environ.setdefault("JWT_SECRET", "test-secret")
 
-const prisma = require('../../src/lib/prisma');
-const AuthService = require('../../src/services/auth.service');
+from app.services import auth_service
 
-describe('AuthService.hashPassword / verifyPassword', () => {
-  it('hashes a password and verifies it back', async () => {
-    const hash = await AuthService.hashPassword('correct horse battery staple');
-    expect(hash).not.toBe('correct horse battery staple');
-    const ok = await AuthService.verifyPassword('correct horse battery staple', hash);
-    expect(ok).toBe(true);
-  });
 
-  it('rejects the wrong password', async () => {
-    const hash = await AuthService.hashPassword('right-password');
-    const ok = await AuthService.verifyPassword('wrong-password', hash);
-    expect(ok).toBe(false);
-  });
-});
+def test_hash_and_verify_password_roundtrip():
+    hashed = auth_service.hash_password("correct horse battery staple")
+    assert hashed != "correct horse battery staple"
+    assert auth_service.verify_password("correct horse battery staple", hashed) is True
 
-describe('AuthService.login', () => {
-  beforeEach(() => {
-    prisma.admin.findUnique.mockReset();
-    process.env.JWT_SECRET = 'test-secret';
-  });
 
-  it('returns a token for valid credentials', async () => {
-    const passwordHash = await AuthService.hashPassword('good-password');
-    prisma.admin.findUnique.mockResolvedValue({
-      id: 1,
-      email: 'admin@test.com',
-      passwordHash,
-    });
+def test_verify_password_rejects_wrong_password():
+    hashed = auth_service.hash_password("right-password")
+    assert auth_service.verify_password("wrong-password", hashed) is False
 
-    const result = await AuthService.login('admin@test.com', 'good-password');
 
-    expect(result).toHaveProperty('token');
-    expect(typeof result.token).toBe('string');
-  });
+def _fake_admin(id_=1, email="admin@test.com", password="good-password"):
+    admin = MagicMock()
+    admin.id = id_
+    admin.email = email
+    admin.password_hash = auth_service.hash_password(password)
+    return admin
 
-  it('throws InvalidCredentialsError for unknown email', async () => {
-    prisma.admin.findUnique.mockResolvedValue(null);
 
-    await expect(AuthService.login('nobody@test.com', 'whatever')).rejects.toThrow(
-      AuthService.InvalidCredentialsError
-    );
-  });
+def test_login_returns_token_for_valid_credentials():
+    admin = _fake_admin()
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = admin
 
-  it('throws InvalidCredentialsError for wrong password', async () => {
-    const passwordHash = await AuthService.hashPassword('good-password');
-    prisma.admin.findUnique.mockResolvedValue({
-      id: 1,
-      email: 'admin@test.com',
-      passwordHash,
-    });
+    token = auth_service.login(db, "admin@test.com", "good-password")
 
-    await expect(AuthService.login('admin@test.com', 'bad-password')).rejects.toThrow(
-      AuthService.InvalidCredentialsError
-    );
-  });
-});
+    assert isinstance(token, str)
+    assert len(token) > 0
 
-describe('AuthService.verifyToken', () => {
-  beforeEach(() => {
-    process.env.JWT_SECRET = 'test-secret';
-  });
 
-  it('decodes a token produced by login', async () => {
-    const passwordHash = await AuthService.hashPassword('good-password');
-    prisma.admin.findUnique.mockResolvedValue({
-      id: 42,
-      email: 'admin@test.com',
-      passwordHash,
-    });
-    const { token } = await AuthService.login('admin@test.com', 'good-password');
+def test_login_raises_for_unknown_email():
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
 
-    const decoded = AuthService.verifyToken(token);
+    with pytest.raises(auth_service.InvalidCredentialsError):
+        auth_service.login(db, "nobody@test.com", "whatever")
 
-    expect(decoded.sub).toBe(42);
-    expect(decoded.email).toBe('admin@test.com');
-  });
 
-  it('throws on a garbage token', () => {
-    expect(() => AuthService.verifyToken('not-a-real-token')).toThrow();
-  });
-});
+def test_login_raises_for_wrong_password():
+    admin = _fake_admin(password="good-password")
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = admin
+
+    with pytest.raises(auth_service.InvalidCredentialsError):
+        auth_service.login(db, "admin@test.com", "bad-password")
+
+
+def test_verify_token_decodes_a_token_from_login():
+    admin = _fake_admin(id_=42, email="admin@test.com")
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = admin
+
+    token = auth_service.login(db, "admin@test.com", "good-password")
+    decoded = auth_service.verify_token(token)
+
+    assert decoded["sub"] == 42
+    assert decoded["email"] == "admin@test.com"
+
+
+def test_verify_token_raises_on_garbage_token():
+    with pytest.raises(Exception):
+        auth_service.verify_token("not-a-real-token")
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run (from `backend/`): `npm test`
-Expected: FAIL — `Cannot find module '../../src/services/auth.service'`
+Run: `pytest tests/unit/test_auth_service.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'app.services.auth_service'`
 
-- [ ] **Step 4: Create `backend/src/services/auth.service.js`**
+- [ ] **Step 4: Create `backend/app/services/auth_service.py`**
 
-```javascript
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-const prisma = require('../lib/prisma');
+```python
+import os
+from datetime import datetime, timedelta, timezone
 
-const SALT_ROUNDS = 10;
-const TOKEN_EXPIRY = '8h';
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
 
-class InvalidCredentialsError extends Error {
-  constructor() {
-    super('Invalid email or password');
-    this.name = 'InvalidCredentialsError';
-  }
-}
+from app.models.admin import Admin
 
-async function hashPassword(plain) {
-  return bcrypt.hash(plain, SALT_ROUNDS);
-}
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-async function verifyPassword(plain, hash) {
-  return bcrypt.compare(plain, hash);
-}
+TOKEN_EXPIRY_HOURS = 8
+JWT_ALGORITHM = "HS256"
 
-async function login(email, password) {
-  const admin = await prisma.admin.findUnique({ where: { email } });
-  if (!admin) {
-    throw new InvalidCredentialsError();
-  }
 
-  const passwordMatches = await verifyPassword(password, admin.passwordHash);
-  if (!passwordMatches) {
-    throw new InvalidCredentialsError();
-  }
+class InvalidCredentialsError(Exception):
+    """Raised when login is attempted with an unknown email or wrong password."""
 
-  const token = jwt.sign({ sub: admin.id, email: admin.email }, process.env.JWT_SECRET, {
-    expiresIn: TOKEN_EXPIRY,
-  });
 
-  return { token };
-}
+def hash_password(plain: str) -> str:
+    return pwd_context.hash(plain)
 
-function verifyToken(token) {
-  return jwt.verify(token, process.env.JWT_SECRET);
-}
 
-module.exports = {
-  hashPassword,
-  verifyPassword,
-  login,
-  verifyToken,
-  InvalidCredentialsError,
-};
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def login(db: Session, email: str, password: str) -> str:
+    admin = db.query(Admin).filter(Admin.email == email).first()
+    if admin is None:
+        raise InvalidCredentialsError()
+
+    if not verify_password(password, admin.password_hash):
+        raise InvalidCredentialsError()
+
+    payload = {
+        "sub": admin.id,
+        "email": admin.email,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXPIRY_HOURS),
+    }
+    secret = os.environ["JWT_SECRET"]
+    return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
+
+
+def verify_token(token: str) -> dict:
+    secret = os.environ["JWT_SECRET"]
+    try:
+        return jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
+    except JWTError as exc:
+        raise JWTError("Invalid or expired token") from exc
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run (from `backend/`): `npm test`
-Expected: PASS (all `auth.service.test.js` + previous `health.test.js` tests green)
+Run: `pytest tests/unit/test_auth_service.py -v`
+Expected: PASS (all 7 tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add backend/src/services backend/tests/unit backend/package.json backend/package-lock.json
-git commit -m "feat: add AuthService with bcrypt hashing and JWT issuing"
+git add backend/app/services backend/tests/unit
+git commit -m "feat: add auth_service with bcrypt hashing and JWT issuing"
 ```
 
 ---
 
-### Task 5: `requireAdmin` middleware + `POST /api/auth/login` route (integration tests, real test DB)
+### Task 4: `require_admin` dependency + `POST /api/auth/login` route (integration tests, real test DB)
 
 **Files:**
-- Create: `backend/src/middleware/requireAdmin.js`
-- Create: `backend/src/controllers/auth.controller.js`
-- Create: `backend/src/routes/auth.routes.js`
-- Modify: `backend/src/app.js` (mount the auth router)
-- Test: `backend/tests/integration/auth.routes.test.js`
+- Create: `backend/app/dependencies/__init__.py`
+- Create: `backend/app/dependencies/require_admin.py`
+- Create: `backend/app/schemas/__init__.py`
+- Create: `backend/app/schemas/auth.py`
+- Create: `backend/app/routers/__init__.py`
+- Create: `backend/app/routers/auth.py`
+- Modify: `backend/app/main.py` (mount the auth router; add a protected test route)
+- Test: `backend/tests/integration/test_auth_routes.py`
 - Modify: `backend/.env.example`, `backend/.env` (add `TEST_DATABASE_URL`)
-- Modify: `backend/package.json` (add `pretest` DB reset script)
+- Modify: `backend/tests/integration/test_health.py` may need no change — confirm it still passes.
 
 **Interfaces:**
-- Consumes: `AuthService.login`, `AuthService.verifyToken`, `AuthService.InvalidCredentialsError`
-  from Task 4; `prisma` from Task 3.
-- Produces: `requireAdmin` Express middleware (attaches `req.admin = { sub, email }` or responds
-  `401 { error: 'Unauthorized' }`) — later tasks (product/order/quote admin routes in S5+) mount
-  this on protected routes. Route `POST /api/auth/login` mounted at `/api/auth/login`.
+- Consumes: `auth_service.login`, `auth_service.verify_token`,
+  `auth_service.InvalidCredentialsError` (Task 3); `get_db` (Task 2).
+- Produces: `require_admin` FastAPI dependency (raises `HTTPException(401)` on missing/invalid
+  token, otherwise returns the decoded payload dict) — later tasks (product/order/quote admin
+  routes in S5+) depend on this via `Depends(require_admin)`. Route `POST /api/auth/login` mounted
+  at `/api/auth/login`.
 
 - [ ] **Step 1: Add a separate test database URL**
 
 Edit `backend/.env.example`, add:
 
 ```
-TEST_DATABASE_URL="postgresql://maison:maison_dev_password@localhost:5432/maison_guillard_test?schema=public"
+TEST_DATABASE_URL=postgresql+psycopg2://maison:maison_dev_password@localhost:5432/maison_guillard_test
 ```
 
-Edit `backend/.env` and add the same line (with real values matching your local Postgres).
+Edit `backend/.env` and add the same line (matching your local Postgres).
 
 - [ ] **Step 2: Create the test database and apply migrations to it**
 
 ```bash
 docker compose exec postgres psql -U maison -d maison_guillard -c "CREATE DATABASE maison_guillard_test;"
-cd backend
-DATABASE_URL="$TEST_DATABASE_URL" npx prisma migrate deploy
+DATABASE_URL="$TEST_DATABASE_URL" alembic upgrade head
 ```
 
-On Windows PowerShell use instead: `$env:DATABASE_URL=$env:TEST_DATABASE_URL; npx prisma migrate deploy`
-(or read `TEST_DATABASE_URL` from `.env` manually and pass it inline — any shell works as long as
-`DATABASE_URL` points at `maison_guillard_test` for this one command).
+(Read `TEST_DATABASE_URL` from `.env` if your shell doesn't export it automatically — e.g.
+`export $(grep TEST_DATABASE_URL .env)` first, or just paste the literal URL from Step 1 inline.)
 
-- [ ] **Step 3: Write the failing tests**
+- [ ] **Step 3: Create `backend/app/schemas/__init__.py`** (empty file)
 
-```javascript
-// backend/tests/integration/auth.routes.test.js
-const request = require('supertest');
-const { describe, it, expect, beforeAll, afterAll, beforeEach } = require('vitest');
+- [ ] **Step 4: Create `backend/app/schemas/auth.py`**
 
-process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+```python
+from pydantic import BaseModel
 
-const app = require('../../src/app');
-const prisma = require('../../src/lib/prisma');
-const AuthService = require('../../src/services/auth.service');
 
-describe('POST /api/auth/login', () => {
-  beforeAll(async () => {
-    await prisma.admin.deleteMany();
-    const passwordHash = await AuthService.hashPassword('test-password-123');
-    await prisma.admin.create({
-      data: { email: 'admin@test.com', passwordHash },
-    });
-  });
+class LoginRequest(BaseModel):
+    email: str
+    motDePasse: str
 
-  afterAll(async () => {
-    await prisma.admin.deleteMany();
-    await prisma.$disconnect();
-  });
 
-  it('returns 200 and a token for valid credentials', async () => {
-    const res = await request(app)
-      .post('/api/auth/login')
-      .send({ email: 'admin@test.com', motDePasse: 'test-password-123' });
-
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('token');
-  });
-
-  it('returns 401 for a wrong password', async () => {
-    const res = await request(app)
-      .post('/api/auth/login')
-      .send({ email: 'admin@test.com', motDePasse: 'wrong-password' });
-
-    expect(res.status).toBe(401);
-  });
-
-  it('returns 401 for an unknown email', async () => {
-    const res = await request(app)
-      .post('/api/auth/login')
-      .send({ email: 'nobody@test.com', motDePasse: 'whatever' });
-
-    expect(res.status).toBe(401);
-  });
-
-  it('returns 400 when motDePasse is missing', async () => {
-    const res = await request(app).post('/api/auth/login').send({ email: 'admin@test.com' });
-
-    expect(res.status).toBe(400);
-  });
-});
-
-describe('requireAdmin middleware (via a protected test route)', () => {
-  it('rejects requests with no Authorization header', async () => {
-    const res = await request(app).get('/api/health/protected-check');
-    expect(res.status).toBe(401);
-  });
-
-  it('accepts requests with a valid token', async () => {
-    const loginRes = await request(app)
-      .post('/api/auth/login')
-      .send({ email: 'admin@test.com', motDePasse: 'test-password-123' });
-    const { token } = loginRes.body;
-
-    const res = await request(app)
-      .get('/api/health/protected-check')
-      .set('Authorization', `Bearer ${token}`);
-
-    expect(res.status).toBe(200);
-  });
-});
+class TokenResponse(BaseModel):
+    token: str
 ```
 
-> Note: `beforeAll` re-creates the one admin fixture the first `describe` block needs; the second
-> block's `it('accepts...')` logs in again against that same fixture, so test order within this
-> file must stay as written (both blocks share the DB state seeded in the first `beforeAll`).
+- [ ] **Step 5: Create `backend/app/dependencies/__init__.py`** (empty file)
 
-- [ ] **Step 4: Run tests to verify they fail**
+- [ ] **Step 6: Create `backend/app/dependencies/require_admin.py`**
 
-Run (from `backend/`): `npm test`
-Expected: FAIL — `Cannot find module '../../src/routes/auth.routes'` and `404` on
-`/api/health/protected-check` (route doesn't exist yet).
+```python
+from fastapi import Header, HTTPException
 
-- [ ] **Step 5: Create `backend/src/middleware/requireAdmin.js`**
+from app.services import auth_service
 
-```javascript
-const AuthService = require('../services/auth.service');
 
-function requireAdmin(req, res, next) {
-  const header = req.headers.authorization || '';
-  const [scheme, token] = header.split(' ');
+def require_admin(authorization: str = Header(default="")) -> dict:
+    scheme, _, token = authorization.partition(" ")
+    if scheme != "Bearer" or not token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-  if (scheme !== 'Bearer' || !token) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  try {
-    req.admin = AuthService.verifyToken(token);
-    return next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-}
-
-module.exports = requireAdmin;
+    try:
+        return auth_service.verify_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 ```
 
-- [ ] **Step 6: Create `backend/src/controllers/auth.controller.js`**
+- [ ] **Step 7: Create `backend/app/routers/__init__.py`** (empty file)
 
-```javascript
-const AuthService = require('../services/auth.service');
+- [ ] **Step 8: Create `backend/app/routers/auth.py`**
 
-async function login(req, res) {
-  const { email, motDePasse } = req.body;
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 
-  if (!email || !motDePasse) {
-    return res.status(400).json({ error: 'email et motDePasse sont requis' });
-  }
+from app.database import get_db
+from app.schemas.auth import LoginRequest, TokenResponse
+from app.services import auth_service
 
-  try {
-    const { token } = await AuthService.login(email, motDePasse);
-    return res.status(200).json({ token });
-  } catch (err) {
-    if (err instanceof AuthService.InvalidCredentialsError) {
-      return res.status(401).json({ error: 'Identifiants invalides' });
-    }
-    throw err;
-  }
-}
+router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-module.exports = { login };
+
+@router.post("/login", response_model=TokenResponse)
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    try:
+        token = auth_service.login(db, payload.email, payload.motDePasse)
+    except auth_service.InvalidCredentialsError:
+        raise HTTPException(status_code=401, detail="Identifiants invalides")
+    return TokenResponse(token=token)
 ```
 
-- [ ] **Step 7: Create `backend/src/routes/auth.routes.js`**
+- [ ] **Step 9: Mount the router and a protected test route in `backend/app/main.py`**
 
-```javascript
-const express = require('express');
-const authController = require('../controllers/auth.controller');
+```python
+from fastapi import Depends, FastAPI
 
-const router = express.Router();
+from app.dependencies.require_admin import require_admin
+from app.routers import auth
 
-router.post('/login', authController.login);
+app = FastAPI(title="Maison Guillard API")
 
-module.exports = router;
+app.include_router(auth.router)
+
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok"}
+
+
+# Exercises require_admin end-to-end; also useful during S5+ manual testing.
+@app.get("/api/health/protected-check")
+def protected_health_check(admin: dict = Depends(require_admin)):
+    return {"status": "ok", "admin": admin["email"]}
 ```
 
-- [ ] **Step 8: Mount the router and a protected test route in `backend/src/app.js`**
+- [ ] **Step 10: Write the failing tests**
 
-```javascript
-const express = require('express');
-const cors = require('cors');
-const authRoutes = require('./routes/auth.routes');
-const requireAdmin = require('./middleware/requireAdmin');
+```python
+# backend/tests/integration/test_auth_routes.py
+import os
 
-const app = express();
+os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 
-app.use(cors());
-app.use(express.json());
+import pytest
+from fastapi.testclient import TestClient
 
-app.get('/api/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
-});
+from app.database import SessionLocal
+from app.main import app
+from app.models.admin import Admin
+from app.services import auth_service
 
-// Exercises requireAdmin end-to-end; also useful during S5+ manual testing.
-app.get('/api/health/protected-check', requireAdmin, (req, res) => {
-  res.status(200).json({ status: 'ok', admin: req.admin.email });
-});
+client = TestClient(app)
 
-app.use('/api/auth', authRoutes);
 
-module.exports = app;
+@pytest.fixture(autouse=True)
+def seed_admin():
+    db = SessionLocal()
+    db.query(Admin).delete()
+    db.commit()
+    admin = Admin(
+        email="admin@test.com",
+        password_hash=auth_service.hash_password("test-password-123"),
+    )
+    db.add(admin)
+    db.commit()
+    yield
+    db.query(Admin).delete()
+    db.commit()
+    db.close()
+
+
+def test_login_returns_200_and_token_for_valid_credentials():
+    res = client.post(
+        "/api/auth/login",
+        json={"email": "admin@test.com", "motDePasse": "test-password-123"},
+    )
+    assert res.status_code == 200
+    assert "token" in res.json()
+
+
+def test_login_returns_401_for_wrong_password():
+    res = client.post(
+        "/api/auth/login",
+        json={"email": "admin@test.com", "motDePasse": "wrong-password"},
+    )
+    assert res.status_code == 401
+
+
+def test_login_returns_401_for_unknown_email():
+    res = client.post(
+        "/api/auth/login",
+        json={"email": "nobody@test.com", "motDePasse": "whatever"},
+    )
+    assert res.status_code == 401
+
+
+def test_login_returns_422_when_motdepasse_missing():
+    res = client.post("/api/auth/login", json={"email": "admin@test.com"})
+    assert res.status_code == 422
+
+
+def test_protected_route_rejects_missing_authorization_header():
+    res = client.get("/api/health/protected-check")
+    assert res.status_code == 401
+
+
+def test_protected_route_accepts_valid_token():
+    login_res = client.post(
+        "/api/auth/login",
+        json={"email": "admin@test.com", "motDePasse": "test-password-123"},
+    )
+    token = login_res.json()["token"]
+
+    res = client.get(
+        "/api/health/protected-check",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert res.status_code == 200
 ```
 
-- [ ] **Step 9: Run tests to verify they pass**
+> Note: FastAPI/Pydantic rejects a request missing a required field with `422` (not `400` — this
+> differs from a hand-rolled Express validator, which is why the missing-field test above expects
+> `422`, matching Pydantic's actual behavior rather than the REST convention table in the doc
+> technique written for the Node stack).
 
-Run (from `backend/`): `npm test`
-Expected: PASS (all tests across all three test files green)
+- [ ] **Step 11: Run tests to verify they fail**
 
-- [ ] **Step 10: Commit**
+Run: `pytest tests/integration/test_auth_routes.py -v`
+Expected: FAIL — collection error or 404s, since the router/dependency files don't fully wire
+together yet before this step (if Steps 1-9 above were already done in order, this may partially
+pass — run it anyway to confirm the full suite, including this file, is green only after Step 9 is
+truly complete).
+
+- [ ] **Step 12: Run the full test suite to verify everything passes**
+
+Run: `pytest -v`
+Expected: PASS (all tests across `test_health.py`, `test_auth_service.py`, `test_auth_routes.py`)
+
+- [ ] **Step 13: Commit**
 
 ```bash
-git add backend/src backend/tests backend/.env.example
-git commit -m "feat: add POST /api/auth/login route and requireAdmin middleware"
+git add backend/app backend/tests backend/.env.example
+git commit -m "feat: add POST /api/auth/login route and require_admin dependency"
 ```
 
 ---
 
-### Task 6: Admin seed script
+### Task 5: Admin seed script
 
 **Files:**
-- Create: `backend/prisma/seed.js`
-- Modify: `backend/package.json` (add `"seed"` script and `prisma.seed` config)
+- Create: `backend/seed.py`
 
 **Interfaces:**
-- Consumes: `AuthService.hashPassword` (Task 4), `prisma` (Task 3), `SEED_ADMIN_EMAIL` /
-  `SEED_ADMIN_PASSWORD` env vars (Task 3's `.env.example`).
-- Produces: one `Admin` row in the dev database, usable to log in from the frontend in Task 7.
+- Consumes: `auth_service.hash_password` (Task 3), `SessionLocal`, `Admin` (Task 2),
+  `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` env vars (Task 2's `.env.example`).
+- Produces: one `Admin` row in the dev database, usable to log in from the frontend in Task 6.
 
-- [ ] **Step 1: Create `backend/prisma/seed.js`**
+- [ ] **Step 1: Create `backend/seed.py`**
 
-```javascript
-require('dotenv').config();
-const prisma = require('../src/lib/prisma');
-const AuthService = require('../src/services/auth.service');
+```python
+import os
 
-async function main() {
-  const email = process.env.SEED_ADMIN_EMAIL;
-  const password = process.env.SEED_ADMIN_PASSWORD;
+from dotenv import load_dotenv
 
-  if (!email || !password) {
-    throw new Error('SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD must be set in .env');
-  }
+load_dotenv()
 
-  const existing = await prisma.admin.findUnique({ where: { email } });
-  if (existing) {
-    console.log(`Admin ${email} already exists, skipping.`);
-    return;
-  }
+from app.database import SessionLocal
+from app.models.admin import Admin
+from app.services import auth_service
 
-  const passwordHash = await AuthService.hashPassword(password);
-  await prisma.admin.create({ data: { email, passwordHash } });
-  console.log(`Created admin account for ${email}.`);
-}
 
-main()
-  .catch((err) => {
-    console.error(err);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+def main():
+    email = os.environ["SEED_ADMIN_EMAIL"]
+    password = os.environ["SEED_ADMIN_PASSWORD"]
+
+    db = SessionLocal()
+    try:
+        existing = db.query(Admin).filter(Admin.email == email).first()
+        if existing:
+            print(f"Admin {email} already exists, skipping.")
+            return
+
+        admin = Admin(email=email, password_hash=auth_service.hash_password(password))
+        db.add(admin)
+        db.commit()
+        print(f"Created admin account for {email}.")
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-- [ ] **Step 2: Add the `seed` script to `backend/package.json`**
+- [ ] **Step 2: Run the seed script against the dev database**
 
-```json
-{
-  "scripts": {
-    "seed": "node prisma/seed.js"
-  }
-}
-```
-
-- [ ] **Step 3: Run the seed script against the dev database**
-
-Run (from `backend/`): `npm run seed`
+Run: `python seed.py`
 Expected: `Created admin account for <SEED_ADMIN_EMAIL>.`
 
-- [ ] **Step 4: Verify manually with curl**
+- [ ] **Step 3: Verify manually**
+
+Start the API in another terminal: `uvicorn app.main:app --reload --port 3000` (from `backend/`,
+venv activated).
 
 Run: `curl -X POST http://localhost:3000/api/auth/login -H "Content-Type: application/json" -d "{\"email\":\"<SEED_ADMIN_EMAIL>\",\"motDePasse\":\"<SEED_ADMIN_PASSWORD>\"}"`
-(start the server first in another terminal: `npm run dev`, from `backend/`)
 Expected: JSON response with a `token` field.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add backend/prisma/seed.js backend/package.json
+git add backend/seed.py
 git commit -m "feat: add admin account seed script"
 ```
 
 ---
 
-### Task 7: Frontend Vite/React skeleton with admin login page
+### Task 6: Frontend Vite/React skeleton with admin login page
 
 **Files:**
 - Create: `frontend/package.json`
@@ -854,10 +802,13 @@ git commit -m "feat: add admin account seed script"
 - Create: `frontend/src/pages/admin/PageLoginAdmin.jsx`
 
 **Interfaces:**
-- Consumes: backend `POST /api/auth/login` (Task 5), read from `import.meta.env.VITE_API_URL`.
+- Consumes: backend `POST /api/auth/login` (Task 4), read from `import.meta.env.VITE_API_URL`.
 - Produces: `AuthContext` exposing `{ token, isAuthenticated, login(email, password), logout() }`
   — S5's `DashboardAdmin` and protected admin routes will wrap themselves in this context and read
   `isAuthenticated` / call `logout()`.
+
+Entirely unaffected by the backend stack change — identical to the original Node-stack plan for
+this task, since the frontend only talks to the backend over HTTP.
 
 - [ ] **Step 1: Scaffold the Vite React app**
 
@@ -890,12 +841,15 @@ export async function loginRequest(email, motDePasse) {
   const data = await res.json();
 
   if (!res.ok) {
-    throw new Error(data.error || 'Échec de la connexion');
+    throw new Error(data.detail || 'Échec de la connexion');
   }
 
   return data.token;
 }
 ```
+
+> Note: FastAPI's default error body shape is `{"detail": "..."}`, not `{"error": "..."}` — this
+> is why `data.detail` is read here instead of `data.error`.
 
 - [ ] **Step 4: Create `frontend/src/context/AuthContext.jsx`**
 
@@ -1021,9 +975,9 @@ export default function App() {
 
 - [ ] **Step 7: Manual verification**
 
-With the backend running (`npm run dev` in `backend/`, Postgres up, admin seeded from Task 6),
-run (from `frontend/`): `npm run dev`, open the printed local URL, submit the login form with the
-seeded admin's email/password.
+With the backend running (`uvicorn app.main:app --reload --port 3000` in `backend/`, venv
+activated, Postgres up, admin seeded from Task 5), run (from `frontend/`): `npm run dev`, open the
+printed local URL, submit the login form with the seeded admin's email/password.
 Expected: form replaced by "Connecté en tant qu'administrateur." with a working "Se déconnecter"
 button. Submitting wrong credentials shows the error message inline instead.
 
@@ -1036,7 +990,7 @@ git commit -m "feat: add vite react skeleton with admin login page and auth cont
 
 ---
 
-### Task 8: Wire remaining docs and merge to `dev`
+### Task 7: Wire remaining docs and merge to `dev`
 
 **Files:**
 - Modify: `README.md`
@@ -1045,7 +999,7 @@ git commit -m "feat: add vite react skeleton with admin login page and auth cont
 - Consumes: nothing new.
 - Produces: nothing consumed by later tasks — this is the wrap-up task for S4.
 
-- [ ] **Step 1: Update root `README.md` with the actual commands verified in Tasks 1-7**
+- [ ] **Step 1: Update root `README.md` with the actual commands verified in Tasks 1-6**
 
 ```markdown
 # Maison Guillard
@@ -1060,11 +1014,13 @@ Web app for presenting and selling handmade furniture. See
 2. Backend:
    ```
    cd backend
-   cp .env.example .env   # then edit JWT_SECRET, SEED_ADMIN_EMAIL, SEED_ADMIN_PASSWORD
-   npm install
-   npx prisma migrate dev
-   npm run seed
-   npm run dev             # API on http://localhost:3000
+   python -m venv .venv
+   source .venv/Scripts/activate   # Windows Git Bash; use .venv/bin/activate on macOS/Linux
+   pip install -r requirements.txt
+   cp .env.example .env            # then edit JWT_SECRET, SEED_ADMIN_EMAIL, SEED_ADMIN_PASSWORD
+   alembic upgrade head
+   python seed.py
+   uvicorn app.main:app --reload --port 3000
    ```
 3. Frontend:
    ```
@@ -1076,13 +1032,13 @@ Web app for presenting and selling handmade furniture. See
 
 ## Tests
 
-`cd backend && npm test` — unit tests (mocked Prisma) + integration tests (real Postgres test
+`cd backend && pytest -v` — unit tests (faked DB session) + integration tests (real Postgres test
 database, see `TEST_DATABASE_URL` in `backend/.env`).
 ```
 
 - [ ] **Step 2: Run the full backend test suite one last time**
 
-Run (from `backend/`): `npm test`
+Run (from `backend/`, venv activated): `pytest -v`
 Expected: PASS, all tests.
 
 - [ ] **Step 3: Commit**
@@ -1102,4 +1058,5 @@ git checkout main
 
 Leave the merge to `main` for the weekly checkpoint per the doc technique's SCM strategy (`dev` →
 `main` only at week's end / milestones, never a direct commit) — do not merge `dev` into `main` as
-part of this task.
+part of this task. This is also a merge to a shared/long-lived branch — confirm with the project
+owner before running it, per the "ask before a merge" norm.
