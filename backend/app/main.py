@@ -1,12 +1,13 @@
 from fastapi import Depends, FastAPI
 
 from app.dependencies.require_admin import require_admin
-from app.routers import auth, categories
+from app.routers import auth, categories, produits
 
 app = FastAPI(title="Maison Guillard API")
 
 app.include_router(auth.router)
 app.include_router(categories.router)
+app.include_router(produits.router)
 
 
 @app.get("/api/health")
