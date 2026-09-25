@@ -22,3 +22,13 @@ Web app for presenting and selling handmade furniture. See
 ## Tests
 
 `cd backend && .\.venv\Scripts\python.exe -m pytest -v`
+
+## S5 — Back-office produits/catégories/photos
+
+New endpoints under `/api/produits`, `/api/categories`, `/api/photos` — see
+`docs/superpowers/specs/2026-09-22-s5-produit-categorie-photo-design.md` for the full design.
+
+Photo uploads are stubbed: files are saved locally under `backend/uploads/` (gitignored) and served
+back at `http://localhost:3000/uploads/<filename>` instead of going to a real Cloudinary account.
+Swap `photo_service.upload_to_cloudinary` for the real SDK call when Cloudinary credentials exist —
+its signature (`upload_to_cloudinary(fichier) -> url`) doesn't need to change.
